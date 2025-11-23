@@ -4,6 +4,8 @@ Shows training examples, test input, prediction, and ground truth.
 """
 
 import torch
+import torch.nn as nn
+import torch.optim as optim
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.colors import ListedColormap
@@ -45,7 +47,56 @@ def load_lean_model(checkpoint_path, device='cpu'):
     return model
 
 
-def visualize_task(model, batch_dict, device='cpu', save_path=None):
+def run_ttt(model, x_train_list, y_train_list, device, steps=50, lr=0.05):
+    """
+    Run Test-Time Training (S2) to optimize z_task.
+    Optimizes z_task to minimize reconstruction loss on the support set.
+    """
+    # 1. Initialize z_task
+    # Get latent dim from model
+    latent_dim = model.refiner.task_embed_table.embedding_dim
+    z_task = torch.zeros(1, latent_dim, device=device, requires_grad=True)
+    
+    # 2. Setup Optimizer
+    optimizer = optim.Adam([z_task], lr=lr)
+    
+    print(f"    Running S2 Inference ({steps} steps)...")
+    
+    # 3. Optimization Loop
+    model.eval() # Keep model in eval mode (BatchNorm, Dropout, etc.)
+    
+    for step in range(steps):
+        optimizer.zero_grad()
+        total_loss = 0
+        
+        # Compute loss over all support pairs
+        # We treat each support pair as a "test" case and try to reconstruct it
+        # using the rule derived from the FULL support set (including itself).
+        for i, (x_sup, y_sup) in enumerate(zip(x_train_list, y_train_list)):
+            # x_sup: (1, H, W), y_sup: (1, H, W)
+            target_shape = (y_sup.shape[1], y_sup.shape[2])
+            
+            # Forward pass
+            # Note: We pass the full support set as context
+            logits = model(x_sup, x_train_list, y_train_list, z_task=z_task, target_shape=target_shape)
+            
+            # Calculate Cross Entropy
+            # logits: (1, H, W, C) -> (1, C, H, W) for CE Loss
+            logits_perm = logits.permute(0, 3, 1, 2)
+            loss = nn.CrossEntropyLoss()(logits_perm, y_sup)
+            total_loss += loss
+            
+        # Backward
+        total_loss.backward()
+        optimizer.step()
+        
+        if step % 10 == 0 or step == steps - 1:
+             print(f"      Step {step}: Loss = {total_loss.item():.4f}")
+             
+    return z_task.detach()
+
+
+def visualize_task(model, batch_dict, device='cpu', save_path=None, ttt_steps=0):
     """Visualize a single task: inputs, prediction, ground truth."""
     # Prepare data
     pairs = batch_dict['train_pairs']
@@ -68,9 +119,14 @@ def visualize_task(model, batch_dict, device='cpu', save_path=None):
     y_train_list = [y1, y2]
     target_shape = (y_star.shape[1], y_star.shape[2])
     
+    # Run S2 / TTT if requested
+    z_task = None
+    if ttt_steps > 0:
+        z_task = run_ttt(model, x_train_list, y_train_list, device, steps=ttt_steps)
+    
     # Run inference
     with torch.no_grad():
-        logits = model(x_test, x_train_list, y_train_list, target_shape=target_shape)
+        logits = model(x_test, x_train_list, y_train_list, z_task=z_task, target_shape=target_shape)
         pred = logits.argmax(dim=-1)  # (B, H, W)
     
     # Convert to numpy
@@ -192,6 +248,8 @@ def main():
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--save_dir', type=str, default='visualizations/lean',
                        help='Directory to save visualizations')
+    parser.add_argument('--ttt_steps', type=int, default=50,
+                       help='Number of Test-Time Training steps (0 to disable)')
     
     args = parser.parse_args()
     
@@ -215,9 +273,30 @@ def main():
     exact_matches = 0
     
     print(f"\nVisualizing {args.num_examples} examples...")
-    for i, batch_list in enumerate(val_loader):
-        if i >= args.num_examples:
-            break
+    
+    # Set fixed seed for reproducibility of sample selection
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    # Create a list of indices to process deterministically
+    indices = list(range(len(val_dataset)))
+    indices = indices[:args.num_examples]
+    
+    for i in indices:
+        # Manually get item to avoid random shuffle from DataLoader
+        # Note: The dataset __getitem__ might still have randomness if it samples pairs.
+        # For validation, ARCDataset typically uses fixed split or we should force it.
+        batch_dict = val_dataset[i]
+        
+        # Wrap in batch dimension (collate_fn logic manually)
+        # batch_dict keys: 'train_pairs', 'test_pair', 'task_id'
+        # We need to make them lists or tensors with batch dim
+        
+        # train_pairs is list of (x, y). We need to keep them as list of tuples, 
+        # but each tensor inside needs batch dim.
+        # Actually, the visualizer expects batch_dict from DataLoader which is a list of dicts.
+        # Let's just wrap it in a list
+        batch_list = [batch_dict]
             
         batch_dict = batch_list[0]
         
@@ -227,7 +306,7 @@ def main():
             continue
         
         save_path = os.path.join(args.save_dir, f'example_{i+1}.png')
-        acc, exact = visualize_task(model, batch_dict, device=args.device, save_path=save_path)
+        acc, exact = visualize_task(model, batch_dict, device=args.device, save_path=save_path, ttt_steps=args.ttt_steps)
         
         if acc is not None:
             accuracies.append(acc)

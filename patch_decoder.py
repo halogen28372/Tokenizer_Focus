@@ -24,7 +24,7 @@ class PatchTransformerDecoder(nn.Module):
                  d_model=512, 
                  n_head=8, 
                  n_layers=6, 
-                 max_len=1024): # 32x32 output
+                 max_len=1024): # 32x32 = 1024
         super().__init__()
         
         self.d_model = d_model
@@ -32,9 +32,10 @@ class PatchTransformerDecoder(nn.Module):
         self.num_colors = num_colors
         
         # 1. Learnable Queries ("Canvas slots")
-        # The decoder asks: "What goes in position (0,0)? What goes in (0,1)?"
-        # interacting with the rule-enriched input memory.
-        self.query_emb = nn.Parameter(torch.randn(1, max_len, d_model) * 0.02)
+        # Reshapeable 2D queries: (1, H_max, W_max, D)
+        # We initialize as 1D for compatibility but treat as 2D
+        self.canvas_size = int(max_len**0.5) # 32
+        self.query_emb = nn.Parameter(torch.randn(1, self.canvas_size, self.canvas_size, d_model) * 0.02)
         
         # 2. Transformer Decoder
         decoder_layer = nn.TransformerDecoderLayer(
@@ -56,29 +57,31 @@ class PatchTransformerDecoder(nn.Module):
         Args:
             memory: (B, L_in, D) - From Rule Inductor (Encoded Input + Rule Context)
             output_shape: tuple (H, W) - Desired output dimensions.
-                          If None, defaults to 32x32 or max_len.
+                          If None, defaults to canvas_size (64x64).
         Returns:
             logits: (B, H, W, Num_Colors)
         """
         B = memory.shape[0]
         
-        # Prepare Queries
-        # If we knew the target H,W, we could slice the positional embeddings intelligently.
-        # For now, we just take the first H*W queries.
         if output_shape is None:
-            H, W = 30, 30 # Standard ARC max
+            H, W = self.canvas_size, self.canvas_size
         else:
             H, W = output_shape
             
-        L_out = H * W
-        if L_out > self.max_len:
-            raise ValueError(f"Requested output size {H}x{W}={L_out} exceeds max_len {self.max_len}")
-            
-        # (B, L_out, D)
-        tgt = self.query_emb[:, :L_out, :].expand(B, -1, -1)
+        if H > self.canvas_size or W > self.canvas_size:
+            # Warn or error? Error for now to avoid silent failures
+             raise ValueError(f"Requested output size {H}x{W} exceeds canvas size {self.canvas_size}x{self.canvas_size}")
+
+        # Crop queries to target size: (1, H, W, D)
+        tgt_queries = self.query_emb[:, :H, :W, :] 
+        
+        # Flatten to sequence: (1, L_out, D)
+        tgt_flat = tgt_queries.reshape(1, -1, self.d_model)
+        
+        # Expand to batch: (B, L_out, D)
+        tgt = tgt_flat.expand(B, -1, -1)
         
         # Decode
-        # tgt is the Query, memory is Key/Value
         out_seq = self.transformer_decoder(tgt, memory)
         out_seq = self.norm(out_seq)
         
@@ -101,4 +104,3 @@ if __name__ == "__main__":
     print(f"Memory: {memory.shape}")
     print(f"Output Logits: {logits.shape}") # Should be (1, 10, 10, 10)
     print("Patch Decoder Test passed!")
-

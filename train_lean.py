@@ -56,6 +56,16 @@ def train_epoch(model, train_loader, optimizer, epoch, device, cfg):
             # Our data loader gives pairs.
             pairs = batch_dict['train_pairs']
             test_pair = batch_dict['test_pair']
+            task_id_str = batch_dict['task_id']
+            
+            # Resolve task_id to integer
+            # If task_id is not in our training set (e.g. validation), we pass None
+            # But this is training loop, so it should be there.
+            if hasattr(model, 'task_to_idx') and task_id_str in model.task_to_idx:
+                t_idx = model.task_to_idx[task_id_str]
+                task_ids = torch.tensor([t_idx], device=device)
+            else:
+                task_ids = None
             
             # We can augment by rotating who is "test"
             # For simplicity, use standard split from loader
@@ -72,12 +82,21 @@ def train_epoch(model, train_loader, optimizer, epoch, device, cfg):
             
             # 2. Forward Pass
             # (B, H, W, C) logits
-            logits = model(x_test, x_train_list, y_train_list, target_shape=target_shape)
+            logits = model(x_test, x_train_list, y_train_list, task_ids=task_ids, target_shape=target_shape)
             
             # 3. Loss (Cross Entropy)
             # logits: (B, H, W, C) -> (B, C, H, W)
             logits_perm = logits.permute(0, 3, 1, 2)
-            loss = F.cross_entropy(logits_perm, y_test.long())
+            
+            # CRITICAL FIX: Weighted loss to prevent mode collapse (predicting only black)
+            # Weights: 0 (background) gets low weight, 1-9 get high weight
+            # We use 0.1 for background, 1.0 for others
+            if not hasattr(model, 'class_weights'):
+                weights = torch.ones(model.num_colors, device=device)
+                weights[0] = 0.1
+                model.class_weights = weights
+            
+            loss = F.cross_entropy(logits_perm, y_test.long(), weight=model.class_weights)
             
             # 4. Metrics
             pred = logits.argmax(dim=-1)
@@ -207,8 +226,37 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
     
+    # 0. Build Task ID Mapping
+    # Create a consistent mapping from task_id string to integer index
+    # We use the list of files from the training dataset
+    # Note: F8a8fe49ARCDataset initializes ARCDataset which populates self.task_files
+    # But we need to access it.
+    
+    # Helper to get unique tasks from dataset
+    def get_task_list(dataset):
+        # F8a8fe49ARCDataset -> ARCDataset
+        # The dataset logic loads files.
+        # We can just inspect the .task_files attribute
+        return [f.stem for f in dataset.task_files]
+
+    train_tasks = get_task_list(train_dataset)
+    task_to_idx = {t_id: i for i, t_id in enumerate(train_tasks)}
+    num_train_tasks = len(train_tasks)
+    print(f"Found {num_train_tasks} unique training tasks.")
+
+    # Model Config
+    class Config:
+        def __init__(self):
+            self.NUM_TRAIN_TASKS = num_train_tasks
+            self.D_FEAT = 512
+            self.NUM_COLORS = 10
+    
+    config = Config()
+    
     # Model
-    model = LeanEBTSystem().to(args.device)
+    model = LeanEBTSystem(config=config).to(args.device)
+    # Store mapping in model for reference (optional)
+    model.task_to_idx = task_to_idx
     params = sum(p.numel() for p in model.parameters())
     print(f"Model Params: {params:,}")
     
