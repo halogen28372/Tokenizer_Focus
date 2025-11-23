@@ -33,6 +33,7 @@ from torch.utils.data import DataLoader
 
 # Load Lean Model
 from lean_model import LeanEBTSystem
+from spatial_loss import SpatialAttractorLoss
 
 config = None
 
@@ -96,7 +97,20 @@ def train_epoch(model, train_loader, optimizer, epoch, device, cfg):
                 weights[0] = 0.1
                 model.class_weights = weights
             
-            loss = F.cross_entropy(logits_perm, y_test.long(), weight=model.class_weights)
+            loss_ce = F.cross_entropy(logits_perm, y_test.long(), weight=model.class_weights)
+            
+            # Spatial Attraction Loss (The Funnel)
+            # We initialize on the fly or passing in cfg would be better, but this is "Lean"
+            # Using default tau=1.5 as suggested
+            if not hasattr(model, 'spatial_loss_fn'):
+                model.spatial_loss_fn = SpatialAttractorLoss(tau=1.5, ignore_index=0).to(device)
+            
+            # Spatial loss expects [B, C, H, W], so use logits_perm
+            loss_spatial = model.spatial_loss_fn(logits_perm, y_test)
+            
+            # Combined Loss: CE (The Spike) + Spatial (The Funnel)
+            # Weighting spatial by 0.5
+            loss = loss_ce + 0.5 * loss_spatial
             
             # 4. Metrics
             pred = logits.argmax(dim=-1)
